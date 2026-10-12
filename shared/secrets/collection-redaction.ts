@@ -1,3 +1,4 @@
+import type { AuthConfig, Collection, CollectionItem } from '../types';
 import { SECRET_FIELDS_BY_AUTH_BLOCK } from './auth-fields';
 import {
   countSecretKeyValues,
@@ -5,7 +6,6 @@ import {
   type SecretableRow,
 } from './key-value-redaction';
 import { isSecretHandle, redactSecret, type SecretValue, unwrapSecret } from './secret-ref';
-import type { AuthConfig, Collection, CollectionItem } from '../types';
 
 /**
  * Redacts secret-bearing auth fields from a collection before it goes through
@@ -63,12 +63,16 @@ function countAuthInlineSecrets(auth: AuthConfig | undefined): number {
 }
 
 /**
- * OpenCollection auth `type`s whose plaintext IS captured by the typed internal
- * model (and therefore counted via {@link countAuthInlineSecrets}). Any other
- * non-empty type degrades to `type:'none'` on import (OAuth1/NTLM/WSSE/…),
- * leaving its credential material ONLY in the `_oc` passthrough bag.
+ * OpenCollection auth `type`s whose string credentials ARE captured by the
+ * typed internal model (and therefore counted via {@link countAuthInlineSecrets}).
+ * Any other non-empty type degrades to `type:'none'` on import, leaving its
+ * credential material ONLY in the `_oc` passthrough bag.
  *
- * Keep in sync with `authToInternal` in `src/lib/opencollection/to-internal.ts`
+ * Applies ONLY to auth on modelled OC nodes. Auth inside an opaque item
+ * ({@link MODELLED_OC_ITEM_TYPES}) never reaches the typed model whatever its
+ * type, so the bag counter counts all of its credentials.
+ *
+ * Keep in sync with `authToInternal` in `shared/opencollection/to-internal.ts`
  * (its non-`default` cases) — that switch decides which types reach the typed
  * model; this set must mirror it or the bag counter will double- or under-count.
  */
@@ -80,12 +84,15 @@ const TYPED_OC_AUTH_TYPES = new Set([
   'awsv4',
   'digest',
   'oauth2',
+  'oauth1',
+  'ntlm',
+  'wsse',
 ]);
 
 /**
- * String credential fields on OC degrade-to-none auth blocks (OAuth1/NTLM/WSSE).
- * `password` covers NTLM/WSSE; `consumerSecret`/`accessTokenSecret` cover OAuth1.
- * (OAuth1 `privateKey` is object-valued and handled separately in
+ * String credential fields on OC degrade-to-none auth blocks (unknown types
+ * that still carry the familiar field names). (OAuth1 `privateKey` is
+ * object-valued and never reaches the typed model — handled separately in
  * {@link countAuthBlockSecrets}; cert passphrases are handled by `obj.passphrase`
  * in {@link countOcBagInlineSecrets}.)
  */
@@ -101,13 +108,38 @@ const ALL_OC_AUTH_SECRET_FIELDS = new Set([
   'clientSecret',
 ]);
 
+function isPlainObject(v: unknown): v is Record<string, unknown> {
+  return !!v && typeof v === 'object' && !Array.isArray(v);
+}
+
+/**
+ * Nested credential objects inside an OC auth block. The OC schema nests OAuth2
+ * secrets (`credentials.clientSecret`, `resourceOwner.password`); Restura's
+ * `authToInternal` only reads the flat fields, so nested material is bag-only
+ * for EVERY node — typed or opaque. `privateKey` is excluded: it is
+ * `{ type: 'file' | 'text', value }` and a file path is not a secret, so it is
+ * handled explicitly.
+ */
+function nestedAuthObjects(
+  auth: Record<string, unknown>
+): Array<[string, Record<string, unknown>]> {
+  const out: Array<[string, Record<string, unknown>]> = [];
+  for (const [key, value] of Object.entries(auth)) {
+    if (key !== 'privateKey' && isPlainObject(value)) out.push([key, value]);
+  }
+  return out;
+}
+
 function redactOcAuthBlock(auth: Record<string, unknown>): Record<string, unknown> {
   const next: Record<string, unknown> = { ...auth };
   for (const field of ALL_OC_AUTH_SECRET_FIELDS) {
     if (typeof next[field] === 'string') next[field] = '';
   }
-  if (next.privateKey && typeof next.privateKey === 'object' && !Array.isArray(next.privateKey)) {
-    const privateKey = next.privateKey as Record<string, unknown>;
+  for (const [key, nested] of nestedAuthObjects(next)) {
+    next[key] = redactOcAuthBlock(nested);
+  }
+  if (isPlainObject(next.privateKey)) {
+    const privateKey = next.privateKey;
     if (privateKey.type === 'text' && typeof privateKey.value === 'string') {
       next.privateKey = { ...privateKey, value: '' };
     }
@@ -143,47 +175,109 @@ function hasNonEmptyString(obj: Record<string, unknown>, fields: Set<string>): b
   return false;
 }
 
+function countNonEmptyStrings(obj: Record<string, unknown>, fields: Set<string>): number {
+  let n = 0;
+  for (const f of fields) {
+    const v = obj[f];
+    if (typeof v === 'string' && v.length > 0) n++;
+  }
+  return n;
+}
+
 /**
- * Counts plaintext secrets that live ONLY in an OpenCollection `_oc` passthrough
- * bag — i.e. credentials the typed counters cannot see: degrade-to-none auth
- * (OAuth1/NTLM/WSSE) and root config secrets (cert passphrases, proxy password).
- * Without this, a collection whose only secret is in a bag returns count 0, the
- * export dialog never fires, and a non-redacted OpenCollection export emits the
- * verbatim bag with plaintext (ADR-0007 violation).
+ * OpenCollection item `info.type`s that `itemToInternal` in
+ * `shared/opencollection/to-internal.ts` turns into a typed internal request.
+ * Every other typed item (`websocket`, `socketio`, any future/unknown type)
+ * becomes a folder PLACEHOLDER whose content — auth included — lives ONLY in
+ * the `_oc` bag, invisible to the typed counters. OC folders carry no
+ * `info.type`; `x-restura-sse` / `x-restura-mcp` extension entries are typed
+ * via `placeExtensionItems` and are recognised by key context instead (see
+ * {@link MODELLED_OC_EXTENSION_LISTS}).
  *
- * Supported auth types (bearer/basic/…) are deliberately ignored here — their
- * plaintext is already in typed fields and counted there; counting the bag copy
- * too would double-report.
+ * Keep in sync with `itemToInternal`'s `info.type` dispatch (and
+ * `placeExtensionItems`) — a type modelled there but missing here is
+ * double-counted; a type listed here but no longer modelled is UNDER-counted
+ * (export plaintext warning suppressed).
  */
-function countAuthBlockSecrets(a: Record<string, unknown>): number {
+const MODELLED_OC_ITEM_TYPES = new Set(['http', 'graphql', 'grpc']);
+
+/** OC extension lists whose entries `placeExtensionItems` imports as typed requests. */
+const MODELLED_OC_EXTENSION_LISTS = new Set(['x-restura-sse', 'x-restura-mcp']);
+
+/** True for an OC item node that `itemToInternal` keeps only as an opaque `_oc` bag. */
+function isOpaqueOcItem(obj: Record<string, unknown>): boolean {
+  const info = obj.info;
+  return (
+    isPlainObject(info) && typeof info.type === 'string' && !MODELLED_OC_ITEM_TYPES.has(info.type)
+  );
+}
+
+/** Non-empty credentials in nested auth objects (OAuth2 `credentials` / `resourceOwner`). */
+function countNestedAuthSecrets(a: Record<string, unknown>): number {
+  let n = 0;
+  for (const [, nested] of nestedAuthObjects(a)) {
+    n += countNonEmptyStrings(nested, ALL_OC_AUTH_SECRET_FIELDS) + countNestedAuthSecrets(nested);
+  }
+  return n;
+}
+
+/**
+ * Counts plaintext secrets in one OC auth block that the typed counters cannot
+ * see. `opaque` is true when the block belongs to an unmodelled item (see
+ * {@link isOpaqueOcItem}): there is no typed copy at all, so EVERY credential
+ * field counts regardless of auth type. In a modelled node the flat string
+ * credentials of supported types (bearer/basic/oauth1/ntlm/wsse/…) are already
+ * counted on the typed model — counting the bag copy too would double-report —
+ * so only bag-only material counts: degrade-to-none types, nested OAuth2
+ * credential objects, and OAuth1 inline RSA keys.
+ */
+function countAuthBlockSecrets(a: Record<string, unknown>, opaque: boolean): number {
   const type = typeof a.type === 'string' ? a.type : undefined;
-  if (type === undefined) {
+  let n: number;
+  if (opaque) {
+    n = countNonEmptyStrings(a, ALL_OC_AUTH_SECRET_FIELDS);
+  } else if (type === undefined) {
     // Untyped auth block (e.g. an OC proxy's `config.auth { username, password }`,
     // which has no `type`) — a non-empty password is a plaintext secret the
     // internal model never captures.
-    return typeof a.password === 'string' && a.password.length > 0 ? 1 : 0;
+    n = typeof a.password === 'string' && a.password.length > 0 ? 1 : 0;
+  } else {
+    // Degrade-to-none (unknown) types: plaintext lives only in the bag.
+    n = !TYPED_OC_AUTH_TYPES.has(type) && hasNonEmptyString(a, OC_SECRET_FIELDS) ? 1 : 0;
   }
-  if (TYPED_OC_AUTH_TYPES.has(type)) return 0;
-  // Degrade-to-none request auth (OAuth1/NTLM/WSSE): plaintext lives only here.
-  let n = hasNonEmptyString(a, OC_SECRET_FIELDS) ? 1 : 0;
+  // Nested credential objects never reach the typed model, whatever the node.
+  n += countNestedAuthSecrets(a);
   // OAuth1 RSA `privateKey` is an object `{ type: 'file' | 'text', value }`; an
   // inline ('text') key is a secret. A 'file' value is a path, not a secret.
-  if (a.privateKey && typeof a.privateKey === 'object') {
-    const pk = a.privateKey as Record<string, unknown>;
+  if (isPlainObject(a.privateKey)) {
+    const pk = a.privateKey;
     if (pk.type === 'text' && typeof pk.value === 'string' && pk.value.length > 0) n += 1;
   }
   return n;
 }
 
-function countOcBagInlineSecrets(node: unknown): number {
+/**
+ * Counts plaintext secrets that live ONLY in an OpenCollection `_oc` passthrough
+ * bag — i.e. credentials the typed counters cannot see: auth inside opaque
+ * (unmodelled) items, degrade-to-none auth, nested OAuth2 credentials, inline
+ * OAuth1 RSA keys, and root config secrets (cert passphrases, proxy password).
+ * Without this, a collection whose only secret is in a bag returns count 0, the
+ * export dialog never fires, and a non-redacted OpenCollection export emits the
+ * verbatim bag with plaintext (ADR-0007 violation).
+ *
+ * @param opaque - `node` sits inside an opaque (unmodelled) OC item.
+ * @param modelled - `node` is known to be a typed node (an SSE/MCP extension
+ *   entry, or the bag of an internal `request` item) — skip the opacity probe.
+ */
+function countOcBagInlineSecrets(node: unknown, opaque = false, modelled = false): number {
   if (!node || typeof node !== 'object') return 0;
-  if (Array.isArray(node)) return node.reduce<number>((n, v) => n + countOcBagInlineSecrets(v), 0);
-  const obj = node as Record<string, unknown>;
-  let count = 0;
-  const auth = obj.auth;
-  if (auth && typeof auth === 'object' && !Array.isArray(auth)) {
-    count += countAuthBlockSecrets(auth as Record<string, unknown>);
+  if (Array.isArray(node)) {
+    return node.reduce<number>((n, v) => n + countOcBagInlineSecrets(v, opaque, modelled), 0);
   }
+  const obj = node as Record<string, unknown>;
+  const inOpaque = opaque || (!modelled && isOpaqueOcItem(obj));
+  let count = 0;
+  if (isPlainObject(obj.auth)) count += countAuthBlockSecrets(obj.auth, inOpaque);
   // Cert / private-key passphrase (root `config.clientCertificates[].passphrase`
   // and per-environment certs) — a string field the internal model never sees.
   if (typeof obj.passphrase === 'string' && obj.passphrase.length > 0) count += 1;
@@ -192,7 +286,7 @@ function countOcBagInlineSecrets(node: unknown): number {
     // everything else (incl. `proxy` → `proxy.config.auth`) so nested config
     // secrets like the proxy password are reached.
     if (key === 'auth' || key === 'passphrase') continue;
-    count += countOcBagInlineSecrets(value);
+    count += countOcBagInlineSecrets(value, inOpaque, MODELLED_OC_EXTENSION_LISTS.has(key));
   }
   return count;
 }
@@ -261,7 +355,14 @@ export function countCollectionInlineSecrets(collection: Collection): number {
     for (const item of items) {
       count += countAuthInlineSecrets(item.auth);
       if (rootOc === undefined) {
-        count += countOcBagInlineSecrets((item as { _oc?: unknown })._oc);
+        // A `request` item's bag mirrors a typed node (http/graphql/grpc item or
+        // SSE/MCP extension entry); a folder's bag is either a real OC folder or
+        // an opaque placeholder, which the `info.type` probe tells apart.
+        count += countOcBagInlineSecrets(
+          (item as { _oc?: unknown })._oc,
+          false,
+          item.type === 'request'
+        );
       }
       if (item.request) {
         const req = item.request as unknown as Record<string, unknown>;
