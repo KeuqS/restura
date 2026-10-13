@@ -1,6 +1,15 @@
 'use client';
 
-import { ChevronDown, ChevronRight, Layers, Loader2, RefreshCw, Search } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronRight,
+  FileUp,
+  Layers,
+  Loader2,
+  RefreshCw,
+  Search,
+  X,
+} from 'lucide-react';
 import { useMemo, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
@@ -13,8 +22,17 @@ interface SchemaExplorerProps {
   schema: GraphQLSchema | null;
   onFieldSelect?: (field: string) => void;
   onRefresh?: () => void;
+  /** Opens the Load schema dialog (SDL / introspection JSON). */
+  onImport?: () => void;
+  /** Drops the request's imported schema (falls back to introspection). */
+  onClearImported?: () => void;
   loading?: boolean;
   loaded?: boolean;
+  /**
+   * Provenance of the request's imported schema (e.g. "From api.graphqls").
+   * Set only when the schema shown was imported by hand.
+   */
+  importedFrom?: string | undefined;
 }
 
 type Kind = 'OBJECT' | 'ENUM' | 'SCALAR' | 'INPUT' | 'INTERFACE';
@@ -27,23 +45,6 @@ const KIND_COLOR: Record<Kind, string> = {
   INPUT: 'var(--color-proto-ws)',
   INTERFACE: 'var(--color-info)',
 };
-
-function kindFor(typeKind: GraphQLTypeKind): Kind {
-  switch (typeKind) {
-    case 'OBJECT':
-      return 'OBJECT';
-    case 'ENUM':
-      return 'ENUM';
-    case 'SCALAR':
-      return 'SCALAR';
-    case 'INPUT_OBJECT':
-      return 'INPUT';
-    case 'INTERFACE':
-      return 'INTERFACE';
-    default:
-      return 'OBJECT';
-  }
-}
 
 function KindBadge({ kind }: { kind: Kind }) {
   const color = KIND_COLOR[kind];
@@ -62,17 +63,17 @@ function KindBadge({ kind }: { kind: Kind }) {
   );
 }
 
-function LoadedPill() {
+function StatusPill({ label, color }: { label: string; color: string }) {
   return (
     <span
       className="sp-label inline-flex items-center px-[5px] py-[1px] rounded-[4px]"
       style={{
-        color: 'var(--color-success)',
-        background: 'color-mix(in srgb, var(--color-success) 16%, transparent)',
+        color,
+        background: `color-mix(in srgb, ${color} 16%, transparent)`,
         letterSpacing: '0.05em',
       }}
     >
-      LOADED
+      {label}
     </span>
   );
 }
@@ -81,9 +82,13 @@ export default function SchemaExplorer({
   schema,
   onFieldSelect,
   onRefresh,
+  onImport,
+  onClearImported,
   loading = false,
   loaded = false,
+  importedFrom,
 }: SchemaExplorerProps) {
+  const imported = importedFrom !== undefined;
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedTypes, setExpandedTypes] = useState<Set<string>>(new Set());
 
@@ -111,18 +116,18 @@ export default function SchemaExplorer({
     if (roots.subscription)
       rows.push({ name: roots.subscription, kind: 'OBJECT', isRoot: 'subscription' });
 
-    const pushKind = (k: GraphQLTypeKind) => {
-      for (const t of getTypesByKind(schema, k)) {
+    const pushKind = (typeKind: GraphQLTypeKind, kind: Kind) => {
+      for (const t of getTypesByKind(schema, typeKind)) {
         if (!t.name || rootNames.has(t.name)) continue;
-        rows.push({ name: t.name, kind: kindFor(t.kind) });
+        rows.push({ name: t.name, kind });
       }
     };
 
-    pushKind('OBJECT');
-    pushKind('INTERFACE');
-    pushKind('INPUT_OBJECT');
-    pushKind('ENUM');
-    pushKind('SCALAR');
+    pushKind('OBJECT', 'OBJECT');
+    pushKind('INTERFACE', 'INTERFACE');
+    pushKind('INPUT_OBJECT', 'INPUT');
+    pushKind('ENUM', 'ENUM');
+    pushKind('SCALAR', 'SCALAR');
 
     return rows;
   }, [schema]);
@@ -146,8 +151,25 @@ export default function SchemaExplorer({
       <div className="flex items-center gap-2 px-3 h-10 border-b border-sp-line shrink-0">
         <Layers className="h-3.5 w-3.5" style={{ color: 'var(--sp-accent)' }} />
         <span className="text-sp-13 font-semibold text-sp-text">Schema</span>
-        {loaded && <LoadedPill />}
-        <div className="ml-auto">
+        {imported ? (
+          <StatusPill label="IMPORTED" color="var(--color-info)" />
+        ) : (
+          loaded && <StatusPill label="LOADED" color="var(--color-success)" />
+        )}
+        <div className="ml-auto flex items-center gap-0.5">
+          {onImport && (
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              onClick={onImport}
+              className="h-6 w-6 p-0 text-sp-muted hover:text-sp-text"
+              aria-label="Load schema file or SDL"
+              title="Load schema (SDL / introspection JSON)"
+            >
+              <FileUp className="h-3.5 w-3.5" />
+            </Button>
+          )}
           <Button
             type="button"
             variant="ghost"
@@ -166,6 +188,25 @@ export default function SchemaExplorer({
         </div>
       </div>
 
+      {imported && (
+        <div className="flex items-center gap-1 px-3 h-7 border-b border-sp-line shrink-0 text-sp-11 text-sp-muted">
+          <span className="truncate" title={importedFrom}>
+            {importedFrom}
+          </span>
+          {onClearImported && (
+            <button
+              type="button"
+              onClick={onClearImported}
+              className="ml-auto inline-flex items-center gap-0.5 shrink-0 hover:text-sp-text"
+              aria-label="Remove imported schema"
+            >
+              <X className="h-3 w-3" />
+              Remove
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Filter */}
       <div className="px-2 py-2 border-b border-sp-line shrink-0">
         <TextField
@@ -182,7 +223,9 @@ export default function SchemaExplorer({
       {!schema && (
         <div className="flex-1 flex items-center justify-center px-4 py-8 text-center">
           <p className="text-sp-12 text-sp-muted">
-            {loading ? 'Loading schema…' : 'No schema loaded. Hit refresh to introspect.'}
+            {loading
+              ? 'Loading schema…'
+              : 'No schema loaded. Hit refresh to introspect, or load an SDL / introspection JSON file if introspection is disabled.'}
           </p>
         </div>
       )}
