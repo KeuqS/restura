@@ -13,7 +13,7 @@ import { Badge } from '@astrojs/starlight/components';
 - **Publish** — send to a topic with a chosen **QoS** (0, 1, or 2) and an optional **retain** flag; payloads are text, JSON, or binary.
 - **Subscribe** — one or more topic filters (wildcards included); messages stream live with topic, QoS, retain / dup flags, and timestamp.
 - **Export the log** — download the current filtered messages as JSON or NDJSON (one message per line).
-- **Auth** — username / password. On desktop the password is stored in the OS keychain (see [secrets](/architecture/adrs/0007-secret-ref-pattern/)) and resolved only at connect time, never persisted in clear.
+- **Auth** — username / password. On desktop the password uses Restura's encrypted secure-storage path (protected by the OS keychain when available) and is loaded only when connecting; the saved connection keeps an opaque sentinel instead of the password in plaintext.
 - **TLS** — `mqtts://` with server-certificate validation, optional client certificate (mTLS: CA / cert / key / passphrase), and a `rejectUnauthorized` toggle.
 - **Last Will & Testament (LWT)** — topic, payload, QoS, and retain that the broker publishes if your client drops.
 - **Session control** — clean start, keepalive, connect timeout, and auto-reconnect.
@@ -40,7 +40,7 @@ This is **pre-flight only** — it does not mitigate a true DNS-rebind (a TTL=0 
 ## Tips
 
 - The message log is capped per connection to keep memory bounded on chatty topics — older messages roll off.
-- For schema-encoded payloads, decode in a [test script](/guides/scripts/).
+- For schema-encoded payloads, export the message log as JSON or NDJSON and decode it with your schema tooling.
 - Set a recognizable **client ID** to make your session easy to spot in broker logs.
 
 ## Related
